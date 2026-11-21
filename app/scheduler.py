@@ -9,13 +9,14 @@ FastAPI 层用一把异步锁保证并发提交不会把同一节点分给两个
 2. 队首需要等待时公布最早开工时刻（预约）；已公布的时刻只会提前、不会推后。
 3. 队首等待期间，按提交顺序检查后续作业：能用当前空位、跑满自己的时限且
    不耽误队首预约（now + duration <= 预约时刻，且不占用预约节点）才放行。
-4. 作业完工回报或达到时限时释放节点并立即重排。
+4. 作业完工回报或达到时限时释放节点并立即重排；同一时刻到期的多个作业按
+   开工顺序全部释放后只重排一次。超时索引只收录当前运行作业，提前完工立即
+   摘除，因此时钟跨过旧时刻时不会因陈旧记录而空转重排。
 5. 节点释放带归属校验：迟到的完工回报面对已结束/已转配的节点不会再次释放。
 """
 
 from __future__ import annotations
 
-import heapq
 import itertools
 from dataclasses import dataclass, field
 from typing import Literal
@@ -58,6 +59,105 @@ class Event:
     rack: str | None = None
 
 
+class _TimeoutHeap:
+    """运行作业的超时索引：小顶堆 + 位置表。
+
+    每个当前运行作业在堆中恰好有一条记录 ``(释放时刻, 开工序号, 作业 id)``，
+    因此索引空间只随当前运行作业数增长，与历史完工作业数无关。作业提前完工
+    时通过 :meth:`discard` 按作业 id 以 O(log n) 摘除，不再留下陈旧时刻；
+    时钟推进时：
+
+    - 堆顶时刻只可能对应仍在运行的作业，纯陈旧时刻根本不会出现，无需扫描
+      整张超时表或作业历史；
+    - 同一时刻的记录按开工序号（同刻时即提交顺序）成批弹出，调用方在全部
+      释放后只做一次重排；
+    - 重排中新开工、且释放时刻不晚于目标时刻的作业会在后续循环中继续处理。
+    """
+
+    def __init__(self) -> None:
+        self._heap: list[tuple[int, int, int]] = []
+        self._pos: dict[int, int] = {}
+
+    def __len__(self) -> int:
+        return len(self._heap)
+
+    def add(self, deadline: int, seq: int, job_id: int) -> None:
+        if job_id in self._pos:
+            raise KeyError(f"作业 {job_id} 的超时记录已存在")
+        entry = (deadline, seq, job_id)
+        self._pos[job_id] = len(self._heap)
+        self._heap.append(entry)
+        self._sift_up(len(self._heap) - 1)
+
+    def earliest_time(self) -> int | None:
+        return self._heap[0][0] if self._heap else None
+
+    def pop_due(self, t: int) -> list[tuple[int, int, int]]:
+        """弹出释放时刻恰好为 ``t`` 的全部记录，按 (时刻, 序号, 作业 id) 有序。"""
+        due: list[tuple[int, int, int]] = []
+        while self._heap and self._heap[0][0] == t:
+            _, _, jid = self._heap[0]
+            due.append(self._pop(0))
+        return due
+
+    def discard(self, job_id: int) -> None:
+        """摘除指定作业的超时记录；记录不存在（如已超时弹出）时不做任何事。"""
+        idx = self._pos.get(job_id)
+        if idx is None:
+            return
+        self._pop(idx)
+
+    def clear(self) -> None:
+        self._heap.clear()
+        self._pos.clear()
+
+    def _pop(self, idx: int) -> tuple[int, int, int]:
+        heap = self._heap
+        removed = heap[idx]
+        last = heap.pop()
+        if idx < len(heap):
+            heap[idx] = last
+            self._pos[last[2]] = idx
+            self._sift_down(self._sift_up(idx))
+        del self._pos[removed[2]]
+        return removed
+
+    def _sift_up(self, idx: int) -> int:
+        heap = self._heap
+        entry = heap[idx]
+        while idx > 0:
+            parent = (idx - 1) // 2
+            if heap[parent] <= entry:
+                break
+            heap[idx] = heap[parent]
+            self._pos[heap[idx][2]] = idx
+            idx = parent
+        heap[idx] = entry
+        self._pos[entry[2]] = idx
+        return idx
+
+    def _sift_down(self, idx: int) -> int:
+        heap = self._heap
+        n = len(heap)
+        entry = heap[idx]
+        while True:
+            left = idx * 2 + 1
+            if left >= n:
+                break
+            right = left + 1
+            child = left
+            if right < n and heap[right] < heap[left]:
+                child = right
+            if heap[child] >= entry:
+                break
+            heap[idx] = heap[child]
+            self._pos[heap[idx][2]] = idx
+            idx = child
+        heap[idx] = entry
+        self._pos[entry[2]] = idx
+        return idx
+
+
 class Scheduler:
     """单机模拟调度器（非线程安全，外层加锁）。"""
 
@@ -76,8 +176,9 @@ class Scheduler:
         self.owners: dict[str, dict[int, int]] = {
             rack: {} for rack in self.rack_names
         }
-        # (释放时刻, 序号, 作业 id)
-        self._timeout_heap: list[tuple[int, int, int]] = []
+        # 运行作业的超时索引：每条记录对应一个当前运行作业，
+        # 完工即摘除，规模恒等于运行作业数（见 _TimeoutHeap）
+        self._timeout_heap = _TimeoutHeap()
         self._seq = itertools.count()
         self._next_id = 1
         self._events: list[Event] = []
@@ -140,9 +241,8 @@ class Scheduler:
         job.assigned_nodes = sorted(nodes)
         job.actual_start = self.now
         self.queue.remove(job.job_id)
-        heapq.heappush(
-            self._timeout_heap,
-            (self.now + job.duration, next(self._seq), job.job_id),
+        self._timeout_heap.add(
+            self.now + job.duration, next(self._seq), job.job_id,
         )
         labels = {
             "direct": "直接开工",
@@ -283,6 +383,8 @@ class Scheduler:
         for n in job.assigned_nodes:
             if owner_map.get(n) == job.job_id:
                 del owner_map[n]
+        # 同步摘除超时索引：完工/被杀后该作业不再占用任何索引空间
+        self._timeout_heap.discard(job.job_id)
         job.status = "finished" if reason == "completed" else "killed"
         job.finish_time = at
         job.finish_reason = reason
@@ -330,28 +432,32 @@ class Scheduler:
     def _process_timeouts(self, until: int) -> list[Event]:
         """处理释放时刻 <= until 的所有超时。
 
-        按释放时刻逐批弹出，并在每个时刻立即重排；重排中新启动的回填作业
-        若时限也落在 ``until`` 之前，会在后续循环中被继续处理。堆中条目
-        可能已陈旧（作业提前完工），通过作业状态与实际释放时刻过滤。
+        超时索引只包含当前运行作业，因此堆顶时刻一定是有效的待释放时刻，
+        推进途中不会再遇到只挂着陈旧记录的旧时刻（也就不会在没有节点释放时
+        空转重排）。每个时刻先把同刻到期的作业按开工序号（同刻即提交顺序）
+        全部释放，再做一次重排；重排中新启动的作业若释放时刻也不晚于
+        ``until``，会在后续循环中于同一次推进内继续处理。
         """
         events: list[Event] = []
-        while self._timeout_heap and self._timeout_heap[0][0] <= until:
-            t = self._timeout_heap[0][0]
-            due_ids: list[int] = []
-            while self._timeout_heap and self._timeout_heap[0][0] == t:
-                _, _, jid = heapq.heappop(self._timeout_heap)
-                due_ids.append(jid)
+        while True:
+            t = self._timeout_heap.earliest_time()
+            if t is None or t > until:
+                break
+            due = self._timeout_heap.pop_due(t)
             self.now = t
-            for jid in due_ids:
+            released = 0
+            for _, _, jid in due:
                 job = self.jobs[jid]
-                # 陈旧条目：已完工或实际释放时刻已变化，跳过
+                # 防御性校验：索引与作业状态一致，运行中的作业才释放
                 if job.status != "running":
                     continue
                 if job.actual_start + job.duration != t:
                     continue
                 events.append(self._release(job, "killed", t))
-            # 每个释放时刻都立即重排，回填作业可能在该时刻入场
-            events.extend(self.reschedule())
+                released += 1
+            # 仅在确有节点释放时重排；纯跳过旧时刻不产生调度动作
+            if released:
+                events.extend(self.reschedule())
         return events
 
     # ------------------------------------------------------------------ 时钟

@@ -249,3 +249,152 @@ def test_event_log_is_bounded():
         s.reset()
         submit(s, 1, 1)
     assert len(s._events) <= Scheduler.MAX_EVENTS
+
+
+# --------------------------------------------- 超时索引：只随运行作业数增长
+
+def test_early_completions_keep_timeout_index_bounded_to_running_jobs():
+    # 多个回填作业接连提前完工：它们原定的超时时刻不应留在索引里
+    s = make_scheduler((4,))
+    early_ids = [submit(s, 1, 10) for _ in range(2)]
+    # 后两个作业时限更晚：本次推进的目标时刻之前不会到期
+    long_ids = [submit(s, 1, 15) for _ in range(2)]
+    assert len(s._timeout_heap) == 4          # 与运行作业数一致
+
+    # 接连两次提前完工，每完成一个索引就同步收缩
+    s.advance(2)
+    s.report_completion(early_ids[0], 2)
+    assert len(s._timeout_heap) == 3
+    assert early_ids[0] not in s._timeout_heap._pos
+    s.report_completion(early_ids[1], 2)
+    assert len(s._timeout_heap) == 2
+    assert early_ids[1] not in s._timeout_heap._pos
+    # 完工记录仍可查询
+    assert s.jobs[early_ids[0]].status == "finished"
+    assert s.jobs[early_ids[0]].finish_time == 2
+
+    # 跨过两个原定超时时刻 t=10（已随完工摘除，属陈旧时刻）到 t=12：
+    # 剩余作业 t=15 才到期，窗口内没有任何节点释放；
+    # 旧实现会在 t=10 因陈旧堆条目空转一次重排，修复后只在目标时刻重排一次
+    calls = {"n": 0}
+    original = s.reschedule
+
+    def counting_reschedule():
+        calls["n"] += 1
+        return original()
+
+    s.reschedule = counting_reschedule
+    try:
+        _, target, events = s.advance(10)
+    finally:
+        s.reschedule = original
+    assert target == 12
+    assert calls["n"] == 1
+    assert [e.type for e in events].count("job_timeout") == 0
+    # 索引仍只包含两个在跑的长作业，历史完工作业不占空间
+    assert len(s._timeout_heap) == 2
+    assert set(s._timeout_heap._pos) == set(long_ids)
+    assert all(s.jobs[j].status == "running" for j in long_ids)
+    # 提前完工者的历史记录仍可查询
+    assert s.jobs[early_ids[0]].status == "finished"
+    assert s.jobs[early_ids[1]].finish_reason == "completed"
+
+
+def test_timeout_index_size_tracks_running_jobs_through_mixed_history():
+    s = make_scheduler((4,))
+    # 先制造一批已完工的历史作业
+    old = [submit(s, 1, 2) for _ in range(4)]
+    s.advance(1)
+    s.report_completion(old[0], 1)
+    s.report_completion(old[1], 1)
+    s.advance(2)                                # 剩余两个时限被杀
+    running = [j for j in s.jobs.values() if j.status == "running"]
+    assert running == []
+    # 历史作业再多，超时索引也已清空（不随作业历史增长）
+    assert len(s._timeout_heap) == 0
+    assert s._timeout_heap._pos == {}
+
+    # 新一轮作业：索引规模始终等于当前运行作业数
+    fresh = [submit(s, 1, 5) for _ in range(3)]
+    running = [j for j in s.jobs.values() if j.status == "running"]
+    assert len(s._timeout_heap) == len(running) == 3
+    s.advance(3)
+    s.report_completion(fresh[0], 3)
+    running = [j for j in s.jobs.values() if j.status == "running"]
+    assert len(s._timeout_heap) == len(running) == 2
+    s.advance(5)                                # 余下两个在 t=8 时限到期
+    assert len(s._timeout_heap) == 0
+
+
+def test_same_time_timeouts_release_all_in_order_then_reschedule_once():
+    # 四个作业同一时刻到期：按开工顺序全部释放后只重排一次
+    s = make_scheduler((4,))
+    ids = [submit(s, 1, 5) for _ in range(4)]
+    calls = {"n": 0}
+    original = s.reschedule
+
+    def counting_reschedule():
+        calls["n"] += 1
+        return original()
+
+    s.reschedule = counting_reschedule
+    try:
+        _, target, events = s.advance(5)
+    finally:
+        s.reschedule = original
+    assert target == 5
+    timeouts = [e for e in events if e.type == "job_timeout"]
+    assert [e.job_id for e in timeouts] == ids  # 同刻按原顺序全部释放
+    assert calls["n"] == 1                       # 全部释放后只重排一次
+    assert all(s.jobs[j].status == "killed"
+               and s.jobs[j].finish_time == 5 for j in ids)
+    assert len(s._timeout_heap) == 0
+
+
+def test_job_started_during_advance_due_at_target_is_processed_too():
+    # 推进途中开工的作业，时限恰好落在目标时刻，也要在本次推进中处理
+    s = make_scheduler((4,))
+    blocker = submit(s, 4, 2)                   # t=2 释放机架
+    short = submit(s, 1, 3)                     # t=2 才开工 -> t=5 到期
+    assert s.jobs[short].status == "queued"
+    _, target, events = s.advance(5)
+    assert target == 5
+    types = [e.type for e in events]
+    assert types.count("job_timeout") == 2      # blocker@2、short@5
+    assert s.jobs[blocker].finish_time == 2
+    assert s.jobs[short].actual_start == 2
+    assert s.jobs[short].status == "killed"
+    assert s.jobs[short].finish_time == 5
+    assert len(s._timeout_heap) == 0
+
+
+def test_timeout_heap_discard_preserves_heap_invariant_and_ordering():
+    from app.scheduler import _TimeoutHeap
+
+    h = _TimeoutHeap()
+    # 同刻条目按序号区分；不同时刻按释放时刻排序
+    h.add(10, 1, 101)
+    h.add(10, 2, 102)
+    h.add(5, 3, 103)
+    h.add(8, 4, 104)
+    assert len(h) == 4
+
+    # 摘除中间记录后堆结构与位置表保持一致
+    h.discard(104)
+    assert 104 not in h._pos
+    assert len(h) == 3
+    for idx, entry in enumerate(h._heap):
+        assert h._pos[entry[2]] == idx
+
+    # 最早时刻 t=5 先弹出，随后 t=10 的两条按原序号顺序成批弹出
+    assert h.earliest_time() == 5
+    assert [e[2] for e in h.pop_due(5)] == [103]
+    assert h.earliest_time() == 10
+    assert [e[2] for e in h.pop_due(10)] == [101, 102]
+    assert len(h) == 0 and h._pos == {}
+
+    # 摘除不存在的作业是幂等空操作
+    h.discard(999)
+    h.add(7, 5, 105)
+    h.clear()
+    assert len(h) == 0 and h._pos == {}
